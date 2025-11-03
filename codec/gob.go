@@ -50,12 +50,12 @@ func (g GobCodec) Write(h *Header, body interface{}) (err error) {
 			_ = g.Close()
 		}
 	}()
-	// 编码头部信息
+	// 先编码头部信息
 	if err := g.enc.Encode(h); err != nil {
 		log.Println("rpc codec: gob error encoding header:", err)
 		return err
 	}
-	// 编码主体信息
+	// 再编码主体信息
 	if err := g.enc.Encode(body); err != nil {
 		log.Println("rpc codec: gob error encoding body:", err)
 	}
