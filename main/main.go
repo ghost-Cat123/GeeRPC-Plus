@@ -2,11 +2,10 @@ package main
 
 import (
 	"GeeRPC"
-	"GeeRPC/codec"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -21,31 +20,28 @@ func startServer(addr chan string) {
 	GeeRPC.Accept(l)
 }
 
+// 使用client.Call 并发5个RPC同步调用
 func main() {
-	// 使用addr信道
+	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
-
-	// in fact, following code is like a simple geerpc client
-	conn, _ := net.Dial("tcp", <-addr)
-	defer func() { _ = conn.Close() }()
+	client, _ := GeeRPC.Dial("tcp", <-addr)
+	defer func() { _ = client.Close() }()
 
 	time.Sleep(time.Second)
-	// send options
-	_ = json.NewEncoder(conn).Encode(GeeRPC.DefaultOption)
-	cc := codec.NewGobCodec(conn)
 	// send request & receive response
+	var wg sync.WaitGroup
 	for i := 0; i < 5; i++ {
-		h := &codec.Header{
-			ServiceMethod: "Foo.Sum",
-			Seq:           uint64(i),
-		}
-		// 发送消息头和消息体
-		_ = cc.Write(h, fmt.Sprintf("geerpc req %d", h.Seq))
-		_ = cc.ReadHeader(h)
-		var reply string
-		// 解析服务端响应reply
-		_ = cc.ReadBody(&reply)
-		log.Println("reply:", reply)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := fmt.Sprintf("geerpc req %d", i)
+			var reply string
+			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+				log.Fatal("call Foo.Sum error:", err)
+			}
+			log.Println("reply:", reply)
+		}(i)
 	}
+	wg.Wait()
 }
