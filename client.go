@@ -129,12 +129,12 @@ func (client *Client) receive() {
 			err = client.cc.ReadBody(nil)
 		// 2. call存在但服务端出错
 		case h.Error != "":
-			call.Error = fmt.Errorf(h.Error)
+			call.Error = errors.New(h.Error)
 			err = client.cc.ReadBody(nil)
 			call.done()
 		// 3. call存在 从body中读取返回值
 		default:
-			err := client.cc.ReadBody(call.Reply)
+			err = client.cc.ReadBody(call.Reply)
 			if err != nil {
 				call.Error = errors.New("reading body " + err.Error())
 			}
