@@ -2,6 +2,7 @@ package GeeRPC
 
 import (
 	"GeeRPC/codec"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call 一次RPC调用所需信息
@@ -52,6 +54,13 @@ type Client struct {
 	// 错误发生 时的关闭
 	shutdown bool
 }
+
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
 var ErrShutdown = errors.New("connection is shut down")
 
@@ -191,15 +200,15 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-// Dial 便于用户传入服务端地址 创建Client实例
-func Dial(netWork, address string, opts ...*Option) (client *Client, err error) {
+// 客户端连接的超时处理
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	// 解析参数
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	// 传入服务端地址 返回连接
-	conn, err := net.Dial(netWork, address)
+	// 传入服务端地址 返回连接 包一层超时处理
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +218,33 @@ func Dial(netWork, address string, opts ...*Option) (client *Client, err error) 
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	// 创建一个通道
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		// 将client和err传入通道 客户端连接
+		ch <- clientResult{client: client, err: err}
+	}()
+	// 没有超时重传
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	// 监听通道操作
+	select {
+	// 如果执行f超过超时时间 触发该分支
+	case <-time.After(opt.ConnectTimeout):
+		// 超时
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	// 在超时时间内完成
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+// Dial 便于用户传入服务端地址 创建Client实例
+func Dial(netWork, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, netWork, address, opts...)
 }
 
 // 发送请求
@@ -263,9 +298,18 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 	return call
 }
 
-// Call 封装Go 同步接口 阻塞 等待响应返回
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
-	// 回调 阻塞Done
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+// Call 封装Go 同步接口 阻塞 等待响应返回 超时处理 ctx让调用者可以进行外部干预
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	// 异步RPC调用 阻塞Done
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	// RPC调用被外部中断
+	case <-ctx.Done():
+		// 清理未完成调用
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	// RPC调用正常完成或或异常失败
+	case call := <-call.Done:
+		return call.Error
+	}
 }

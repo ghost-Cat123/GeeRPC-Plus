@@ -4,12 +4,14 @@ import (
 	"GeeRPC/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
@@ -21,11 +23,18 @@ type Option struct {
 	MagicNumber int
 	// 用户可选的编码格式
 	CodecType codec.Type
+	// 连接超时时间
+	ConnectTimeout time.Duration
+	// 处理超时时间
+	HandleTimeout time.Duration
 }
 
 var DefaultOption = &Option{
 	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	// 默认编码方式Gob
+	CodecType: codec.GobType,
+	// 默认10s
+	ConnectTimeout: time.Second * 10,
 }
 
 // Server RPC服务器
@@ -103,7 +112,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 		// 计数
 		wg.Add(1)
 		// 处理请求
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, DefaultOption.ConnectTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -168,20 +177,51 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 	}
 }
 
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+// 正常情况 由处理方法调用的goroutine发送响应
+// 超时情况 由主goroutine发送超时响应
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// 需要注册rpc方法到正确的响应中
 	// 计数器-1 表示已处理完成一个响应
 	defer wg.Done()
-	// 方法调用
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		// 发生错误 响应错误
-		server.sendResponse(cc, req.h, invalidRequest, sending)
+	// 拆分处理过程
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		// 方法调用
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		// 标记调用完成
+		called <- struct{}{}
+		// 错误分支
+		if err != nil {
+			req.h.Error = err.Error()
+			// 发生错误 响应错误
+			server.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		// 将reply序列化为字节流 构造响应报文
+		// 成功分支
+		server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		// 通过管道发送
+		// 标记响应完成
+		sent <- struct{}{}
+	}()
+
+	// 没有设置超时时间 就一直阻塞
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	// 将reply序列化为字节流 构造响应报文
-	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	// 超时时间大于0 调用优先与超时完成
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+	// 正常执行或发生异常
+	case <-called:
+		<-sent
+	}
 }
 
 // Register 注册服务
