@@ -289,6 +289,13 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 		// 有done 但是缓冲区为0
 		log.Panic("rpc client: done channel is unbuffered")
 	}
+	if client == nil {
+		call := &Call{Error: errors.New("client instance is nil")}
+		if done != nil {
+			done <- call
+		}
+		return call
+	}
 	call := &Call{
 		ServiceMethod: serviceMethod,
 		Args:          args,
@@ -303,6 +310,9 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 
 // Call 封装Go 同步接口 阻塞 等待响应返回 超时处理 ctx让调用者可以进行外部干预
 func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+	if client == nil {
+		return errors.New("client instance is nil")
+	}
 	// 异步RPC调用 阻塞Done
 	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
 	select {
