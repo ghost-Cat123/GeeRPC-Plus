@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -261,4 +262,50 @@ func (server *Server) findService(serviceMethod string) (svc *service, mtype *me
 		err = errors.New("rpc server: can't find method " + methodName)
 	}
 	return
+}
+
+// 使服务端支持HTTP协议
+// 接收CONNECT请求 返回了200状态码 HTTP/1.0 200 Connected to Gee RPC
+
+const (
+	// 隧道建立成功的响应内容
+	connected = "200 Connected to Gee RPC"
+	// RPC请求的默认HTTP路径 区分普通HTTP请求
+	defaultRPCPath = "/_geerpc_"
+	// 调试路径
+	defaultDebugPath = "/debug/geerpc"
+)
+
+// 实现Handler接口中的ServeHTTP方法 即可处理HTTP请求
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// 1. 只有连接请求才被允许
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		// 返回方法不被允许
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	// 2. 劫持HTTP底层TCP连接（关键步骤）
+	// http.Hijacker是ResponseWriter的扩展接口，允许“劫持”连接脱离HTTP协议控制
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	// 3. 向客户端发送隧道建立成功响应
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+
+	// 4. 将劫持的TCP连接交给RPC服务器处理（后续通信脱离HTTP）
+	server.ServeConn(conn)
+}
+
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path:", defaultDebugPath)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

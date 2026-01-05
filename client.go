@@ -2,6 +2,7 @@ package GeeRPC
 
 import (
 	"GeeRPC/codec"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -311,5 +314,49 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 	// RPC调用正常完成或或异常失败
 	case call := <-call.Done:
 		return call.Error
+	}
+}
+
+// NewHTTPClient 客户端实现HTTP协议
+// 发起CONNECT请求 检查返回状态码 成功建立连接
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, err := io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\r\n\r\n", defaultRPCPath))
+	if err != nil {
+		return nil, err
+	}
+
+	// 给服务器发送请求
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+
+	// 创建NewClient 用于后续通讯过程
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+
+	return nil, err
+}
+
+// DialHTTP 监听默认HTTP RPC
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial 根据rpc地址相应不同函数
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// 其他传输协议
+		return Dial(protocol, addr, opts...)
 	}
 }
