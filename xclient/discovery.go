@@ -47,6 +47,7 @@ func NewMultiServerDiscovery(servers []string) *MultiServersDiscovery {
 
 var _ Discovery = (*MultiServersDiscovery)(nil)
 
+// Refresh 手动控制 无需刷新
 func (d *MultiServersDiscovery) Refresh() error {
 	return nil
 }
