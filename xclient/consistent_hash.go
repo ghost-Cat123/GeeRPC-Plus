@@ -4,12 +4,15 @@ import (
 	"hash/crc32"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 // Hash 无符号32位整数 [0, 2^32 - 1]
 type Hash func(data []byte) uint32
 
 type Map struct {
+	// 加锁 保护一致性哈希环
+	mu sync.RWMutex
 	// 哈希表 允许替换成自定义哈希函数
 	hash Hash
 	// 虚拟节点的数量
@@ -36,6 +39,8 @@ func New(replicas int, fn Hash) *Map {
 
 // Add 添加真实节点 传入的是真实节点名称
 func (m *Map) Add(keys ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	// 遍历传入的节点名称
 	for _, key := range keys {
 		// 对于每个节点 创建replicas个虚拟节点
@@ -54,6 +59,8 @@ func (m *Map) Add(keys ...string) {
 
 // Get 选择去哪里找缓存 返回的是真实节点的名称
 func (m *Map) Get(key string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if len(m.keys) == 0 {
 		return ""
 	}

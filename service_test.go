@@ -25,26 +25,28 @@ func TestRegisterMethod(t *testing.T) {
 	server := NewServer()
 	var foo Foo
 	RegisterMethod[Args, int](server, "Foo.Sum", foo.Sum)
-	handlerI, ok := server.serviceMap.Load("Foo.Sum")
+	_, ok := server.serviceMap.Load("Foo.Sum")
 	_assert(ok, "service Method should be registered")
-	_assert(handlerI != nil, "wrong Method, Sum shouldn't nil")
 }
 
 func TestMethodHandler_Call(t *testing.T) {
 	server := NewServer()
 	var foo Foo
 	RegisterMethod[Args, int](server, "Foo.Sum", foo.Sum)
-	handlerI, _ := server.serviceMap.Load("Foo.Sum")
-	handler := handlerI.(MethodHandler)
+	entryI, ok := server.serviceMap.Load("Foo.Sum")
+	_assert(ok, "service Method should be registered")
 
-	decodeFunc := func(v interface{}) error {
-		args := v.(*Args)
-		args.Num1 = 1
-		args.Num2 = 3
-		return nil
-	}
+	entry := entryI.(*handlerEntry)
 
-	replyInter, err := handler(context.Background(), decodeFunc)
-	reply := replyInter.(*int)
-	_assert(err == nil && *reply == 4, "failed to call Foo.Sum")
+	// 模拟主循环：用 newReq 创建实例，填充值（代替 cc.ReadBody）
+	reqVal := entry.newReq()
+	args := reqVal.(*Args)
+	args.Num1 = 1
+	args.Num2 = 3
+
+	// 模拟 handleRequest 的 goroutine 调用业务函数
+	respI, err := entry.handler(context.Background(), reqVal)
+	_assert(err == nil, "handler should not error")
+	reply := respI.(*int)
+	_assert(*reply == 4, "expected 4, got %d", *reply)
 }

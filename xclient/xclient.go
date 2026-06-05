@@ -2,11 +2,12 @@ package xclient
 
 import (
 	. "GrowRPC"
+	"GrowRPC/pool"
 	"context"
 	"io"
-	"log"
 	"reflect"
 	"sync"
+	"time"
 )
 
 // XClient 向用户暴露支持负载均衡的客户端
@@ -19,7 +20,9 @@ type XClient struct {
 	opt *Option
 	mu  sync.Mutex
 	// 复用创建好的Socket连接
-	clients map[string]*Client
+	pools map[string]*pool.Pool
+	// 连接池配置
+	poolOpts []pool.Option
 }
 
 // 利用context上下文传递一致性哈希的key参数
@@ -36,50 +39,55 @@ func WithRoutingKey(ctx context.Context, key string) context.Context {
 
 var _ io.Closer = (*XClient)(nil)
 
-func NewXClient(d Discovery, mode SelectMode, opt *Option) *XClient {
-	return &XClient{d: d, mode: mode, opt: opt, clients: make(map[string]*Client)}
+func NewXClient(d Discovery, mode SelectMode, opt *Option, poolOpts ...pool.Option) *XClient {
+	return &XClient{d: d, mode: mode, opt: opt, pools: make(map[string]*pool.Pool), poolOpts: poolOpts}
 }
 
 // Close 关闭建立的连接
 func (xc *XClient) Close() error {
 	xc.mu.Lock()
 	defer xc.mu.Unlock()
-	for key, clients := range xc.clients {
-		_ = clients.Close()
-		delete(xc.clients, key)
+	for key, p := range xc.pools {
+		_ = p.Close()
+		delete(xc.pools, key)
 	}
 	return nil
 }
 
-func (xc *XClient) dial(rpcAddr string) (*Client, error) {
+func (xc *XClient) dial(rpcAddr string) (*pool.Conn, error) {
 	xc.mu.Lock()
-	defer xc.mu.Unlock()
-	client, ok := xc.clients[rpcAddr]
-	// client不可用
-	if ok && !client.IsAvailable() {
-		_ = client.Close()
-		delete(xc.clients, rpcAddr)
-		client = nil
-	}
-	// 没有缓存Client
-	if client == nil {
-		// 创建新的Client
-		client, err := XDial(rpcAddr, xc.opt)
-		if err != nil {
-			log.Printf("XDial failed for %s: %v", rpcAddr, err) // 关键：看具体失败原因
-			return nil, err
+	p, ok := xc.pools[rpcAddr]
+	if !ok {
+		factory := func() (*Client, error) {
+			return XDial(rpcAddr, xc.opt)
 		}
-		xc.clients[rpcAddr] = client
+		p = pool.New(factory, xc.poolOpts...)
+		xc.pools[rpcAddr] = p
 	}
-	return client, nil
+	xc.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.Get(ctx)
+}
+
+func (xc *XClient) putClient(rpcAddr string, conn *pool.Conn) {
+	xc.mu.Lock()
+	p, ok := xc.pools[rpcAddr]
+	xc.mu.Unlock()
+	if ok {
+		p.Put(conn)
+	} else {
+		_ = conn.Client.Close()
+	}
 }
 
 func (xc *XClient) call(rpcAddr string, ctx context.Context, serviceMethod string, args, reply interface{}) error {
-	client, err := xc.dial(rpcAddr)
+	conn, err := xc.dial(rpcAddr)
 	if err != nil {
 		return err
 	}
-	return client.Call(ctx, serviceMethod, args, reply)
+	defer xc.putClient(rpcAddr, conn)
+	return conn.Client.Call(ctx, serviceMethod, args, reply)
 }
 
 func (xc *XClient) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
@@ -118,7 +126,6 @@ func (xc *XClient) Broadcast(ctx context.Context, serviceMethod string, args, re
 			if reply != nil {
 				clonedReply = reflect.New(reflect.ValueOf(reply).Elem().Type()).Interface()
 			}
-			// 发出请求
 			err := xc.call(rpcAddr, ctx, serviceMethod, args, clonedReply)
 			mu.Lock()
 			defer mu.Unlock()

@@ -4,7 +4,6 @@ import (
 	"GrowRPC/codec/pb"
 	"bufio"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"google.golang.org/protobuf/proto"
 	"io"
@@ -15,10 +14,6 @@ type ProtobufCodec struct {
 	conn io.ReadWriteCloser
 	// 缓冲write
 	buf *bufio.Writer
-	// 信息编码器
-	dec *json.Decoder
-	// 信息解码器
-	enc *json.Encoder
 }
 
 var _ Codec = (*ProtobufCodec)(nil)
@@ -40,7 +35,7 @@ func (p *ProtobufCodec) ReadHeader(h *Header) error {
 	pbHeader := &pb.RequestHeader{}
 	// 从网络流中读取信息，反序列化到pbHeader中
 	if err := p.readMessage(pbHeader); err != nil {
-		return nil
+		return err
 	}
 	// 将pbHeader（TCP）中的数据传递给Header请求头（RPC）
 	h.ServiceMethod = pbHeader.ServiceMethod
@@ -111,7 +106,7 @@ func (p *ProtobufCodec) readMessage(msg proto.Message) error {
 	// 2. 根据长度读取具体字节流
 	data := make([]byte, length)
 	if _, err := io.ReadFull(p.conn, data); err != nil {
-		return nil
+		return err
 	}
 
 	// 3. 反序列化

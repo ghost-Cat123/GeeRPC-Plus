@@ -39,6 +39,11 @@ func (j JsonCodec) ReadHeader(h *Header) error {
 }
 
 func (j JsonCodec) ReadBody(body interface{}) error {
+	if body == nil {
+		// drain: 消费掉本次请求的 body 字节，防止下次 ReadHeader 读到脏数据
+		var raw json.RawMessage
+		return j.dec.Decode(&raw)
+	}
 	return j.dec.Decode(body)
 }
 
