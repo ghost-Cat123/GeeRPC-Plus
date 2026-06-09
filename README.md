@@ -1,99 +1,319 @@
 # GrowRPC
 
-GrowRPC 是一个轻量级、高性能的 Go 语言 RPC 框架，提供了完整的服务端与客户端通信能力，支持服务注册与发现、负载均衡、中间件等特性。
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+GrowRPC 是一个从零实现的轻量级 Go RPC 框架，参考 `net/rpc` 与 gRPC 的设计思想，提供完整的服务通信、服务治理与高可用能力。
 
 ## 功能特性
 
-- **完整的 RPC 通信机制**：支持多种编码格式（Gob/JSON/Protobuf），实现了请求序列化与反序列化、方法调用、错误处理等核心功能
-- **自定义协议头**：设计了自定义协议头，避免 TCP 流式处理产生的粘包问题，确保数据传输的完整性
-- **HTTP 协议支持**：通过 HTTP CONNECT 方法实现 RPC 通信，兼容现有 HTTP 基础设施
-- **服务注册与发现**：基于 HTTP 的服务注册中心，支持服务心跳检测、超时剔除
-- **负载均衡**：支持多种负载均衡策略（随机/轮询/一致性哈希）
+### 核心通信
 
-- **中间件系统**：可插拔的中间件机制，支持请求拦截、日志记录、异常恢复等功能
-- **完善的超时与错误处理**：实现了连接超时、处理超时等机制，提高系统稳定性
-- **级联超时控制 (Context 透传)**：支持将客户端上下文中的 `Deadline` 穿越网络传递至服务端，实现跨服务级联超时中断，避免服务端空转浪费资源
-- **泛型无反射调用**：基于 Go 1.18+ 泛型重构底层服务路由，废弃 `reflect`，实现编译期严格类型检查和运行期零反射损耗的极致性能
+| 特性 | 说明 |
+|------|------|
+| **多协议支持** | Gob / JSON / Protobuf 三种序列化协议，Option 握手自动协商 |
+| **单连接多路复用** | Seq 序号 + pending map，单条 TCP 连接承载多个并发请求，类 HTTP/2 Stream ID |
+| **自定义 TLV 帧格式** | 4 字节大端长度前缀 + Protobuf Payload，解决 TCP 粘包/半包 |
+| **HTTP CONNECT 隧道** | `http.Hijacker` 劫持连接，使 RPC 流量可穿透 HTTP 代理 |
+| **TLS 传输加密** | 通过 `Option.TLSConfig` 零代码改动启用 mTLS |
 
+### 高性能设计
 
-## 演进路线 (TODO List)
+| 特性 | 说明 |
+|------|------|
+| **泛型零反射路由** | Go 1.18+ 泛型 + 闭包工厂消除 `reflect`，handler 调用 10 ns/op（vs 反射 471 ns，47x） |
+| **客户端连接池** | `sync.Mutex` + LIFO 栈 + `active` 精准计数 + 后台清理 goroutine |
+| **并发安全优化** | `sending` 细粒度写锁 + `mu` 读锁分离，消除锁竞争 |
 
-为了打造工业级的现代微服务框架，GrowRPC 正在执行以下升级演进路线：
+### 服务治理
 
-- [x] **Context 链路透传机制**：利用自定义协议头，实现超时时间和元数据跨网络级联透传与取消，防止服务端空转。
-- [x] **防粘包与泛型改造**：结合自定义 TLV 二进制包与 Protobuf 编解码，摒弃性能低下的运行时 `reflect` 反射，基于 Go 1.18 泛型闭包实现零装箱损耗的方法注册与动态路由。
-- [x] **客户端连接池设计**：维护多路复用连接池，彻底解决单条长连接遇到网络抖动时的 TCP 队头阻塞 (Head-of-Line Blocking) 问题。
-- [ ] **云原生注册中心升级**：抛弃简单的内存服务发现，接入 **ETCD** 作为注册中心，基于 Watch 机制实现服务动态发现，并引入 Raft 算法和租约机制解决分布式一致性与选主问题。
-- [ ] **Reactor 事件驱动网络层**：重构底层传输层，将阻塞型 `net` 库替换为类似 `gnet` 或 `Netpoll` 等基于 epoll (Multi-Reactors) 的高效事件驱动网络库，冲击海量并发的极限性能。
+| 特性 | 说明 |
+|------|------|
+| **ETCD 注册中心** | 基于 Lease 租约 + KeepAlive 心跳 + Watch 实时推送，秒级故障感知 |
+| **负载均衡** | Random / Round-Robin / 一致性哈希（CRC32 + 虚拟节点） |
+| **Context 级联超时** | 客户端 Deadline 穿越网络透传至服务端，下游 DB/Redis 可感知并提前熔断 |
+| **令牌桶限流** | 无锁 CAS 实现，支持全局限流 + 按方法粒度精细化限流 |
 
-## 目录结构
+### 中间件系统
+
+| 特性 | 位置 | 说明 |
+|------|------|------|
+| **Logger** | 服务端 | 记录请求耗时、参数与错误 |
+| **Recovery** | 服务端 | panic 全局兜底，防止服务崩溃 |
+| **RateLimit** | 服务端 | 令牌桶限流，QPS 保护 |
+| **Retry** | 客户端 | 指数退避重试，自动区分业务错误与网络错误 |
+| **CircuitBreaker** | 客户端 | 三态熔断器（Closed → Open → HalfOpen），按节点隔离 |
+| **Degradation** | 客户端 | 熔断后自动降级到 fallback 回调 |
+
+### 代码生成
+
+| 特性 | 说明 |
+|------|------|
+| **`protoc-gen-growrpc`** | 自定义 protoc 插件，从 `.proto` 文件自动生成 Server 接口 + Client Stub |
+
+## 项目结构
 
 ```
 GrowRPC/
-├── codec/           # 编解码器实现
-│   ├── pb/          # Protobuf 相关文件
-│   ├── codec.go     # 编解码器接口
-│   ├── gob.go       # Gob 编解码器
-│   ├── json.go      # JSON 编解码器
-│   └── protobuf.go  # Protobuf 编解码器
-├── main/            # 示例代码
-│   └── main.go      # 主示例
-├── midware/         # 中间件实现
-│   └── interceptor.go # 中间件接口和实现
-
-├── registry/        # 服务注册中心
-│   └── registry.go  # 注册中心实现
-├── xclient/         # 扩展客户端
-│   ├── consistent_hash.go # 一致性哈希实现
-│   ├── discovery.go # 服务发现接口
-│   ├── discovery_grow.go # 基于 GrowRegistry 的服务发现
-│   └── xclient.go   # 支持负载均衡的客户端
-├── client.go        # 基础客户端实现
-├── client_test.go   # 客户端测试
-├── debug.go         # 调试工具
-├── go.mod           # Go 模块定义
-├── go.sum           # 依赖校验和
-├── server.go        # 服务端实现
-└── service.go       # 服务定义和注册
+├── codec/                     # 编解码器层
+│   ├── pb/                    # Protobuf 定义与生成代码
+│   ├── codec.go               # Codec 接口 + Header 定义
+│   ├── gob.go                 # Gob 编解码
+│   ├── json.go                # JSON 编解码
+│   ├── protobuf.go            # TLV 帧 + Protobuf 编解码
+│   └── header.proto           # 网络传输头定义
+├── midware/
+│   ├── server/                # 服务端拦截器
+│   │   ├── loggerInterceptor.go
+│   │   ├── recoveryInterceptor.go
+│   │   ├── ratelimit.go       # 令牌桶算法
+│   │   └── rateLimitInterceptor.go
+│   └── client/                # 客户端拦截器
+│       ├── clientInterceptor.go # 重试拦截器
+│       ├── breaker.go           # 熔断器状态机
+│       ├── circuitBreakerInterceptor.go
+│       └── degradationInterceptor.go
+├── registry/
+│   ├── registry.go            # HTTP 注册中心（Deprecated）
+│   └── etcd.go                # ETCD 注册中心
+├── xclient/
+│   ├── consistent_hash.go     # 一致性哈希环
+│   ├── discovery.go           # Discovery 接口 + 手工维护实现
+│   ├── discovery_gee.go       # HTTP 注册中心发现
+│   ├── discovery_etcd.go      # ETCD Watch 发现
+│   └── xclient.go             # 负载均衡客户端
+├── pool/
+│   └── pool.go                # 连接池
+├── cmd/
+│   └── protoc-gen-growrpc/
+│       └── main.go            # protoc 代码生成插件
+├── benchmark/                 # 泛型 vs 反射性能对比
+├── docs/                      # 技术文档
+├── server.go                  # RPC 服务端
+├── client.go                  # RPC 客户端（拦截器链 + RpcError）
+├── service.go                 # 泛型方法注册
+├── debug.go                   # Debug HTTP 端点
+└── main/main.go               # 完整示例
 ```
 
-## 安装
+## 快速开始
+
+### 安装
 
 ```bash
-go get -u github.com/ghost-Cat123/GrowRPC
+go get github.com/ghost-Cat123/GrowRPC
 ```
 
-## 负载均衡策略
+### 定义服务（.proto 文件）
 
-GrowRPC 支持以下负载均衡策略：
+```protobuf
+// math.proto
+syntax = "proto3";
+package math;
+option go_package = "./pb";
 
-- **RandomSelect**：随机选择服务实例
-- **RoundRobin**：轮询选择服务实例
-- **ConsistentHash**：基于一致性哈希选择服务实例
+message MathArgs {
+  int32 a = 1;
+  int32 b = 2;
+}
 
-## 中间件
+message MathReply {
+  int32 result = 1;
+}
 
-GrowRPC 内置了以下中间件：
+service MathService {
+  rpc Add(MathArgs) returns (MathReply);
+  rpc Divide(MathArgs) returns (MathReply);
+}
+```
 
-- **LoggerInterceptor**：记录请求日志和执行时间
-- **RecoveryInterceptor**：捕获并恢复 panic，防止服务崩溃
+### 生成代码
 
-## 编码格式
+```bash
+# 安装插件
+go install ./cmd/protoc-gen-growrpc
 
-GrowRPC 支持以下编码格式：
+# 生成 pb + growrpc stub
+protoc --go_out=. --growrpc_out=. math.proto
+```
 
-- **Gob**：Go 语言特有的编码格式，性能优异
-- **JSON**：通用性好，便于调试
-- **Protobuf**：高效的二进制编码格式，适合跨语言场景
+生成产物：
+- `math.pb.go` — 消息类型定义
+- `math_growrpc.pb.go` — Server interface + Register 函数 + Client Stub
 
-## 性能特性
+### 服务端
 
-- **并发处理**：服务端采用 goroutine 处理每个连接，支持高并发
-- **轻量级锁机制**：发送请求时使用轻量级写锁，确保并发安全的同时最小化性能开销
-- **多路复用**：类似 Epoll 机制，通过维护 pending map 和后台 receive 协程，实现单连接多路复用
-- **高效编码**：支持多种编码格式，可根据场景选择最优方案
-- **负载均衡**：通过多种负载均衡策略，提高系统整体性能
+```go
+package main
 
-## 贡献
+import (
+	"GrowRPC"
+	"GrowRPC/midware/server"
+	"GrowRPC/registry"
+	"context"
+	"net"
+	pb "yourproject/pb"
+)
 
-欢迎提交 Issue 和 Pull Request 来帮助改进 GrowRPC！
+// 实现生成的接口
+type mathImpl struct {
+	pb.UnimplementedMathServiceServer
+}
+
+func (m *mathImpl) Add(ctx context.Context, req *pb.MathArgs, resp *pb.MathReply) error {
+	resp.Result = req.A + req.B
+	return nil
+}
+
+func main() {
+	// 注册服务端中间件
+	bucket := server.NewTokenBucket(1000, 2000)
+	GrowRPC.Use(
+		server.RateLimitInterceptor(bucket, nil),
+		server.LoggerInterceptor,
+		server.RecoveryInterceptor,
+	)
+
+	// 一行注册
+	pb.RegisterMathServiceServer(GrowRPC.DefaultServer, &mathImpl{})
+
+	// ETCD 注册
+	reg, _ := registry.NewEtcdRegistry([]string{"localhost:2379"}, 10)
+	reg.Register("MathService", "192.168.1.5:8080", nil)
+	go reg.KeepAlive(context.Background())
+
+	// 启动监听
+	lis, _ := net.Listen("tcp", ":8080")
+	GrowRPC.Accept(lis)
+}
+```
+
+### 客户端
+
+```go
+package main
+
+import (
+    "GrowRPC"
+    "GrowRPC/xclient"
+    "GrowRPC/midware/client"
+    clientv3 "go.etcd.io/etcd/client/v3"
+    pb "yourproject/pb"
+    "context"
+    "time"
+)
+
+func main() {
+    // ETCD 发现
+    etcdCli, _ := clientv3.New(clientv3.Config{Endpoints: []string{"localhost:2379"}})
+    discovery := xclient.NewEtcdDiscovery(etcdCli, "MathService")
+
+    // 创建负载均衡客户端
+    opt := &GrowRPC.Option{CodecType: "application/protobuf"}
+    xc := xclient.NewXClient(discovery, xclient.RoundRobinSelect, opt)
+
+    // 注册客户端中间件（外层先执行）
+    xc.Use(
+        client.DegradationInterceptor(/* fallbacks */),
+        client.CircuitBreakerInterceptor(5, 30*time.Second),
+        client.RetryInterceptor(client.RetryConfig{MaxAttempts: 3}),
+    )
+
+    // 类型安全的调用
+    mathClient := pb.NewMathServiceClient(xc)
+    reply, err := mathClient.Add(context.Background(), &pb.MathArgs{A: 10, B: 20})
+    // reply.Result == 30
+}
+```
+
+### 不使用代码生成（直接注册）
+
+```go
+type MathArgs struct{ A, B int }
+type MathReply struct{ Result int }
+type MathService struct{}
+
+func (m *MathService) Add(_ context.Context, args *MathArgs, reply *MathReply) error {
+    reply.Result = args.A + args.B
+    return nil
+}
+
+GrowRPC.RegisterMethod[MathArgs, MathReply](
+    GrowRPC.DefaultServer,
+    "MathService.Add",
+    (&MathService{}).Add,
+)
+```
+
+## 中间件组装顺序
+
+### 服务端（`server.Use`）
+
+```
+RateLimit → Logger → Recovery → handler
+```
+
+越晚注册越靠外层。
+
+### 客户端（`xc.Use`）
+
+```
+Degradation → CircuitBreaker → Retry → rawInvoker
+```
+
+执行流程：
+1. Degradation 兜底，捕获所有下层错误
+2. CircuitBreaker：Open 时快速失败 → Degradation 降级
+3. Retry：网络抖动指数退避重试，业务错误直接返回
+4. rawInvoker：discovery.Get → pool.Get → Client.Call
+
+## 错误分类
+
+| 错误类型 | `IsRetryable` | 说明 |
+|---------|:---:|------|
+| `RpcError`（服务端业务错误） | ❌ | 请求被正确处理但被拒绝 |
+| `context.Canceled` / `DeadlineExceeded` | ❌ | 用户主动取消或超时 |
+| `net.OpError`（连接拒绝/超时/重置） | ✅ | 网络基础设施故障，换节点可恢复 |
+| `io.EOF` / `io.ErrUnexpectedEOF` | ✅ | 对端异常断开 |
+
+## 配置项
+
+```go
+type Option struct {
+    MagicNumber    int              // 协议魔数
+    CodecType      codec.Type       // "application/gob" | "application/json" | "application/protobuf"
+    ConnectTimeout time.Duration    // 连接超时
+    HandleTimeout  time.Duration    // 服务端处理超时
+    TLSConfig      *tls.Config      // TLS 配置（nil = 明文）
+}
+```
+
+## TODO
+
+- [x] Context 级联超时透传
+- [x] 泛型零反射服务路由 + Benchmark
+- [x] 客户端连接池（LIFO + active 精准计数）
+- [x] ETCD 注册中心（Lease + KeepAlive + Watch）
+- [x] protoc 代码生成插件（`protoc-gen-growrpc`）
+- [x] 服务端中间件：Logger / Recovery / RateLimit
+- [x] 客户端拦截器链 + Retry / CircuitBreaker / Degradation
+- [x] 错误分类（`RpcError` + `IsRetryable`）
+- [x] TLS 传输加密
+- [x] 优雅关闭（GracefulShutdown）
+- [x] ETCD Watch 自动重连 + KeepAlive 循环重建
+- [ ] 流式 RPC（Server Streaming / Client Streaming / Bidi）
+- [ ] 客户端限流拦截器
+- [ ] OpenTelemetry Tracing
+- [ ] Reactor 网络模型（gnet）
+
+## 性能数据
+
+| 场景 | 泛型方案 | 反射方案 | 提升 |
+|------|---------|---------|:---:|
+| handler 调用开销 | 10 ns / 1 alloc | 471 ns / 6 allocs | 47x |
+| 实例创建开销 | 12 ns / 1 alloc | 18 ns / 1 alloc | 1.5x |
+| 完整路由分发 | 34 ns / 2 allocs | 41 ns / 2 allocs | 1.2x |
+
+## License
+
+MIT
