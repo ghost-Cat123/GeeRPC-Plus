@@ -1,6 +1,7 @@
 package client
 
 import (
+	"GrowRPC"
 	"sync"
 	"time"
 )
@@ -42,27 +43,28 @@ func (cb *CircuitBreaker) Allow() bool {
 	return true
 }
 
-func (cb *CircuitBreaker) Record(success bool) {
+func (cb *CircuitBreaker) Record(err error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	if success {
+	if err == nil {
 		cb.failures = 0
 		cb.state = StateClosed
 		return
 	}
 
+	// 业务错误不计数（服务还活着）
+	if !GrowRPC.IsRetryable(err) {
+		return
+	}
+
+	// 网络错误才计数
 	cb.failures++
 	cb.lastFail = time.Now()
 
-	switch cb.state {
-	case StateClosed:
-		if cb.failures >= cb.threshold {
-			cb.state = StateOpen
-		}
-	case StateHalfOpen:
-		// 试探失败，立即重新熔断
+	if cb.state == StateClosed && cb.failures >= cb.threshold {
 		cb.state = StateOpen
-	case StateOpen:
+	} else if cb.state == StateHalfOpen {
+		cb.state = StateOpen
 	}
 }

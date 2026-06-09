@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"GrowRPC/codec"
@@ -37,6 +38,11 @@ type Server struct {
 	serviceMap   sync.Map
 	interceptors []Interceptor
 	mu           sync.Mutex
+
+	// 新增用于重试熔断降级
+	inFlight atomic.Int64   // 进行中的请求数
+	shutdown atomic.Bool    // 正在关闭标记
+	activeWG sync.WaitGroup // 等待进行中连接结束
 }
 
 func NewServer() *Server {
@@ -131,6 +137,8 @@ func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 			continue
 		}
 		wg.Add(1)
+		// 正在进行的请求
+		server.inFlight.Add(1)
 		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
@@ -204,6 +212,8 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 }
 
 func (server *Server) handleRequest(cc codec.Codec, req *Request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
+	// 调用结束后处理
+	defer server.inFlight.Add(-1)
 	defer wg.Done()
 	called := make(chan struct{}, 1)
 	sent := make(chan struct{}, 1)
@@ -274,6 +284,33 @@ func (server *Server) findEntry(serviceMethod string) (*handlerEntry, error) {
 		return nil, errors.New("rpc server: can't find service method " + serviceMethod)
 	}
 	return entryI.(*handlerEntry), nil
+}
+
+// GracefulShutdown 服务端优雅关闭
+func (server *Server) GracefulShutdown(timeout time.Duration) error {
+	// 正在关闭的标记
+	server.shutdown.Store(true)
+
+	// 等待所有进行中的请求完成
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 定时关闭
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if server.inFlight.Load() == 0 {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			// 关闭请求
+			return fmt.Errorf("graceful shutdown timeout: %d requests still in flight",
+				server.inFlight.Load())
+		}
+	}
 }
 
 // 使服务端支持HTTP协议

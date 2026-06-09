@@ -33,7 +33,7 @@ func CircuitBreakerInterceptor(threshold int, timeout time.Duration) GrowRPC.Cli
 			}
 
 			err := next(ctx, method, req, reply)
-			cb.Record(err == nil)
+			cb.Record(err)
 			return err
 		}
 	}
