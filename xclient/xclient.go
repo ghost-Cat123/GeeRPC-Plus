@@ -23,14 +23,18 @@ type XClient struct {
 	pools map[string]*pool.Pool
 	// 连接池配置
 	poolOpts []pool.Option
+	// 客户端中间件
+	interceptors []ClientInterceptor
 }
 
 // 利用context上下文传递一致性哈希的key参数
 // 1. 定义一个私有类型，防止 context 键名冲突
 type routingKey string
+type targetAddrKey string
 
 // 2. 实例化一个固定的 Key
 const contextKeyRoutingKey routingKey = "rpc_routing_key"
+const ContextKeyTargetAddr targetAddrKey = "rpc_target_addr"
 
 // WithRoutingKey 3. 提供一个对外暴露的辅助函数，方便用户往 ctx 里塞 Key
 func WithRoutingKey(ctx context.Context, key string) context.Context {
@@ -38,6 +42,12 @@ func WithRoutingKey(ctx context.Context, key string) context.Context {
 }
 
 var _ io.Closer = (*XClient)(nil)
+
+func (xc *XClient) Use(interceptors ...ClientInterceptor) {
+	xc.mu.Lock()
+	defer xc.mu.Unlock()
+	xc.interceptors = append(xc.interceptors, interceptors...)
+}
 
 func NewXClient(d Discovery, mode SelectMode, opt *Option, poolOpts ...pool.Option) *XClient {
 	return &XClient{d: d, mode: mode, opt: opt, pools: make(map[string]*pool.Pool), poolOpts: poolOpts}
@@ -92,16 +102,25 @@ func (xc *XClient) call(rpcAddr string, ctx context.Context, serviceMethod strin
 
 func (xc *XClient) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
 	var hashKey string
-	// 用约定好的键查询rpc路由的key值
-	if val := ctx.Value(contextKeyRoutingKey); val != nil {
-		hashKey = val.(string)
+	rawInvoker := func(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+		// 用约定好的键查询rpc路由的key值
+		if val := ctx.Value(contextKeyRoutingKey); val != nil {
+			hashKey = val.(string)
+		}
+		// 如果是一致性哈希才会使用到hashKey
+		rpcAddr, err := xc.d.Get(xc.mode, hashKey)
+		if err != nil {
+			return err
+		}
+		// 注入目标地址到ctx 供熔断器使用
+		ctx = context.WithValue(ctx, ContextKeyTargetAddr, rpcAddr)
+		return xc.call(rpcAddr, ctx, serviceMethod, args, reply)
 	}
-	// 如果是一致性哈希才会使用到hashKey
-	rpcAddr, err := xc.d.Get(xc.mode, hashKey)
-	if err != nil {
-		return err
+	invoker := rawInvoker
+	for i := len(xc.interceptors) - 1; i >= 0; i-- {
+		invoker = xc.interceptors[i](invoker)
 	}
-	return xc.call(rpcAddr, ctx, serviceMethod, args, reply)
+	return invoker(ctx, serviceMethod, args, reply)
 }
 
 // Broadcast 广播请求到所有服务 任意实例发生错误 则返回

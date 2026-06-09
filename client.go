@@ -54,6 +54,8 @@ type Client struct {
 	seq uint64
 	// 存储未处理的请求 seq: Call实例
 	pending map[uint64]*Call
+	// 客户端拦截器链
+	interceptors []ClientInterceptor
 	// 用户关闭 任意一个为true表示不可用
 	closing bool
 	// 错误发生 时的关闭
@@ -68,6 +70,51 @@ type clientResult struct {
 type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
 var ErrShutdown = errors.New("connection is shut down")
+
+// RpcError rpc错误封装用于重试和熔断
+type RpcError struct {
+	Method string
+	Msg    string
+}
+
+func (e *RpcError) Error() string { return "rpc error: " + e.Method + ": " + e.Msg }
+
+// IsRetryable 判断是否可重试
+func IsRetryable(err error) bool {
+	// 1. Context 取消 → 不可重试（用户明确说要停）
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// 2. 服务端业务错误 → 不可重试
+	var rpcErr *RpcError
+	if errors.As(err, &rpcErr) {
+		return false
+	}
+	// 3. 网络层错误 → 可重试
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// 4. 其余一切（配置错、client nil、body 解码失败）→ 默认不可重试
+	return false
+}
+
+// ClientInterceptor 客户端拦截器
+// 签名和服务端一致: func(next Invoker) Invoker，遵循函数式组合的洋葱模型
+type ClientInterceptor func(next Invoker) Invoker
+
+// Use 链式调用中间件
+func (client *Client) Use(interceptors ...ClientInterceptor) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.interceptors = append(client.interceptors, interceptors...)
+}
+
+// Invoker 调用链的终点
+type Invoker func(ctx context.Context, method string, req, reply interface{}) error
 
 var _ io.Closer = (*Client)(nil)
 
@@ -143,7 +190,7 @@ func (client *Client) receive() {
 			err = client.cc.ReadBody(nil)
 		// 2. call存在但服务端出错
 		case h.Error != "":
-			call.Error = errors.New(h.Error)
+			call.Error = &RpcError{Method: call.ServiceMethod, Msg: h.Error}
 			err = client.cc.ReadBody(nil)
 			call.done()
 		// 3. call存在 从body中读取返回值
@@ -239,8 +286,13 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (cli
 	select {
 	// 如果执行f超过超时时间 触发该分支
 	case <-time.After(opt.ConnectTimeout):
-		// 超时
-		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+		// 超时 给重试中间件重试
+		return nil, &net.OpError{
+			Op:   "dial",
+			Net:  network,
+			Addr: parseAddr(network, address),
+			Err:  fmt.Errorf("i/o timeout"),
+		}
 	// 在超时时间内完成
 	case result := <-ch:
 		return result.client, result.err
@@ -329,18 +381,27 @@ func (client *Client) Call(ctx context.Context, serviceMethod string, args, repl
 	if client == nil {
 		return errors.New("client instance is nil")
 	}
-	// 异步RPC调用 阻塞Done
-	call := client.goWithContext(ctx, serviceMethod, args, reply, make(chan *Call, 1))
-	select {
-	// RPC调用被外部中断
-	case <-ctx.Done():
-		// 清理未完成调用
-		client.removeCall(call.Seq)
-		return errors.New("rpc client: call failed: " + ctx.Err().Error())
-	// RPC调用正常完成或或异常失败
-	case call := <-call.Done:
-		return call.Error
+	// 构造最终回调函数
+	rawInvoker := func(ctx context.Context, serviceMethod string, args, reply interface{}) error {
+		// 异步RPC调用 阻塞Done
+		call := client.goWithContext(ctx, serviceMethod, args, reply, make(chan *Call, 1))
+		select {
+		// RPC调用被外部中断
+		case <-ctx.Done():
+			// 清理未完成调用
+			client.removeCall(call.Seq)
+			return errors.New("rpc client: call failed: " + ctx.Err().Error())
+		// RPC调用正常完成或或异常失败
+		case call := <-call.Done:
+			return call.Error
+		}
 	}
+	// 洋葱模型包裹
+	invoker := rawInvoker
+	for i := len(client.interceptors) - 1; i >= 0; i-- {
+		invoker = client.interceptors[i](invoker)
+	}
+	return invoker(ctx, serviceMethod, args, reply)
 }
 
 // NewHTTPClient 客户端实现HTTP协议
@@ -385,4 +446,17 @@ func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
 		// 其他传输协议
 		return Dial(protocol, addr, opts...)
 	}
+}
+
+// 实现地址解析接口
+type addrInfo struct {
+	network string
+	address string
+}
+
+func (a *addrInfo) Network() string { return a.network }
+func (a *addrInfo) String() string  { return a.address }
+
+func parseAddr(network, address string) net.Addr {
+	return &addrInfo{network: network, address: address}
 }

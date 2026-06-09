@@ -2,7 +2,7 @@ package main
 
 import (
 	"GrowRPC"
-	"GrowRPC/midware"
+	"GrowRPC/midware/server"
 	"context"
 	"log"
 	"net"
@@ -49,7 +49,9 @@ func startServer(addr chan string) {
 	// 【核心：注册中间件】
 	// 注意顺序：最外层是 Logger，往里一层是 Recovery。
 	// 洋葱模型执行顺序：Logger进 -> Recovery进 -> 核心逻辑 -> Recovery出 -> Logger出
-	GrowRPC.Use(midware.LoggerInterceptor, midware.RecoveryInterceptor)
+	// 全局1000QPS限流 突发2000QPS 也可按方法限流
+	bucket := server.NewTokenBucket(1000, 2000)
+	GrowRPC.Use(server.RateLimitInterceptor(bucket, nil), server.LoggerInterceptor, server.RecoveryInterceptor)
 
 	// 注册服务
 	mathService := new(MathService)

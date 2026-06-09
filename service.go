@@ -2,10 +2,14 @@ package GrowRPC
 
 import (
 	"context"
+	"fmt"
 )
 
 // DecodeFunc 是主循环用来把流数据读入到 req 的函数
 type DecodeFunc func(v interface{}) error
+
+// ErrNotImplemented 导出变量
+var ErrNotImplemented = fmt.Errorf("method not implemented")
 
 // MethodHandler 定义底层的通用处理函数
 // 调用前 Body 已经被主循环同步 decode 进 req（通过 reqFactory + DecodeFunc）
